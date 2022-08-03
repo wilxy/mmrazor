@@ -101,7 +101,7 @@ class ConfigurableDistiller(BaseDistiller):
                  connectors: Optional[Dict[str, Dict]] = None,
                  distill_losses: Optional[Dict[str, Dict]] = None,
                  loss_forward_mappings: Optional[Dict[str, Dict]] = None,
-                 **kwargs):
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         # The recorder manager is just constructed, but not really initialized
         # yet. Recorder manager initialization needs to input the corresponding
