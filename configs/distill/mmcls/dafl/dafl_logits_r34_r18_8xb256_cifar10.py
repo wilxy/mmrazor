@@ -1,12 +1,12 @@
 _base_ = [
     'mmcls::_base_/datasets/cifar10_bs16.py',
-    # 'mmcls::_base_/schedules/imagenet_bs256.py',
+    'mmcls::_base_/schedules/cifar10_bs128.py',
     'mmcls::_base_/default_runtime.py'
 ]
 
 model = dict(
     _scope_='mmrazor',
-    type='DAFLDataFreeStudentDistillation',
+    type='DAFLDataFreeDistillation',
     data_preprocessor=dict(
         type='ImgDataPreprocessor',
         # RGB format normalization parameters
@@ -16,88 +16,132 @@ model = dict(
         bgr_to_rgb=True),
     architecture=dict(
         cfg_path='mmcls::resnet/resnet18_8xb16_cifar10.py', pretrained=False),
-    teachers=[
-        dict(
-            name='resnet34',
-            cfg=dict(cfg_path='mmcls::resnet/resnet34_8xb16_cifar10', pretrained=True),
-            ckpt_path='/mnt/cache/zhangzhongyu/work_dir/checkpoints/resnet34_b16x8_cifar10_20210528-a8aa36a6.pth'),
-    ]
+    teachers=dict(
+        res34=dict(
+            build_cfg=dict(
+                cfg_path='mmcls::resnet/resnet34_8xb16_cifar10.py',
+                pretrained=True),
+            ckpt_path='/mnt/lustre/zhangzhongyu.vendor/gml/data/GML_data/gml_checkpoint/resnet34_b16x8_cifar10_20210528-a8aa36a6.pth'
+        ),
+    ),
     generator=dict(
         type='DAFLGenerator',
         img_size=32,
         latent_dim=1000,
         hidden_channels=128),
-    distiller_teacher_name='resnet34',
     distiller=dict(
         type='ConfigurableDistiller',
         student_recorders=dict(
             fc=dict(type='ModuleOutputs', source='head.fc')),
         teacher_recorders=dict(
-            fc=dict(type='ModuleOutputs', source='head.fc')),
+            res34_fc=dict(type='ModuleOutputs', source='res34.head.fc')),
         distill_losses=dict(
             loss_kl=dict(type='KLDivergence', tau=1, loss_weight=1)),
         loss_forward_mappings=dict(
             loss_kl=dict(
                 preds_S=dict(from_student=True, recorder='fc'),
-                preds_T=dict(from_student=False, recorder='fc')))),
+                preds_T=dict(from_student=False, recorder='res34_fc')))),
     generator_distiller=dict(
-        type='DataFreeDistiller',
-        multi_teacher_cfgs=[
-            dict(
-                teacher_name='resnet34',
-                teacher_recorders=dict(
-                    neck_gap=dict(type='ModuleOutputs', source='neck.gap'),
-                    fc=dict(type='ModuleOutputs', source='head.fc')),
-                distill_losses=dict(
-                    loss_res34_oh=dict(type='OnehotLikeLoss', loss_weight=0.05),
-                    loss_res34_ie=dict(type='InformationEntropyLoss', loss_weight=5),
-                    loss_res34_ac=dict(type='ActivationLoss', loss_weight=0.01)),
-                loss_forward_mappings=dict(
-                    loss_res34_oh=dict(
-                        preds_T=dict(from_student=False, recorder='fc')),
-                    loss_res34_ie=dict(
-                        preds_T=dict(from_student=False, recorder='fc')),
-                    loss_res34_ac=dict(
-                        preds_T=dict(from_student=False, recorder='neck_gap'))))
-        ]))
+        type='ConfigurableDistiller',
+        teacher_recorders=dict(
+            res34_neck_gap=dict(type='ModuleOutputs', source='res34.neck.gap'),
+            res34_fc=dict(type='ModuleOutputs', source='res34.head.fc')),
+        distill_losses=dict(
+            loss_res34_oh=dict(type='OnehotLikeLoss', loss_weight=0.05),
+            loss_res34_ie=dict(type='InformationEntropyLoss', loss_weight=5),
+            loss_res34_ac=dict(type='ActivationLoss', loss_weight=0.01)),
+        loss_forward_mappings=dict(
+            loss_res34_oh=dict(
+                preds_T=dict(from_student=False, recorder='res34_fc')),
+            loss_res34_ie=dict(
+                preds_T=dict(from_student=False, recorder='res34_fc')),
+            loss_res34_ac=dict(
+                preds_T=dict(from_student=False, recorder='res34_neck_gap')))))
 
 find_unused_parameters = True
 
-val_cfg = dict(_delete_=True, type='mmrazor.SingleTeacherDistillValLoop')
-
 # optimizer
 batch_size_per_gpu = 256
-# optimizer = dict(
-#     model=dict(type='AdamW', lr=1e-1),
-#     generator=dict(type='AdamW', lr=1e-3))
+
 optim_wrapper = dict(
-    _delete_=True,  # 不继承原始optim_wrapper这个dict的内容，即optim_wrapper就只有下面三行的内容
+    _delete_=True,
     constructor='mmrazor.SeparateOptimWrapperConstructor',
     architecture=dict(optimizer=dict(type='AdamW', lr=1e-1)),
     generator=dict(optimizer=dict(type='AdamW', lr=1e-3)))
 
-# learning policy
-lr_config = dict(
-    policy='mmrazor.Multi',
-    lr_updater_cfgs=dict(
-        architecture=dict(
-            policy='step',
-            step=[100 * 120, 200 * 120],
-            by_epoch=False,
-            warmup='linear',
-            warmup_iters=500,
-            warmup_ratio=0.0001,
-        ),
-        generator=dict(
-            policy='fixed',
-            by_epoch=False,
-            warmup='linear',
-            warmup_iters=500,
-            warmup_ratio=0.0001,
-        )),
-)
+param_scheduler = dict(
+    _delete_=True,
+    architecture=dict(
+        type='mmcv.StepLR',
+        step=[100 * 120, 200 * 120],
+        by_epoch=False,
+        warmup='linear',
+        warmup_iters=500,
+        warmup_ratio=0.0001,
+    ),
+    generator=dict(
+        type='mmcv.FixedLR',
+        by_epoch=False,
+        warmup='linear',
+        warmup_iters=500,
+        warmup_ratio=0.0001))
 
-runner = dict(
-    type='mmrazor.DynamicIterBasedRunner',
-    max_iters=250 * 120,
-    is_dynamic_ddp=True)
+# train_cfg = dict(
+#     _delete_=True,
+#     type='mmengine.IterBasedTrainLoop',
+#     max_iters=250 * 120)
+
+train_cfg = dict(
+    _delete_=True,
+    type='mmrazor.DistributedIterBasedLoop',
+    max_iters=250 * 120)
+    # is_dynamic_ddp=True)
+
+# dataset_type = 'CIFAR10'
+# preprocess_cfg = dict(
+#     # RGB format normalization parameters
+#     mean=[125.307, 122.961, 113.8575],
+#     std=[51.5865, 50.847, 51.255],
+#     # loaded images are already RGB format
+#     to_rgb=False)
+# file_client_args = dict(
+#     backend='petrel',
+#     path_mapping=dict({
+#         'data/cifar10': "s3://PAT/datasets/Imagenet"})
+# )
+
+# train_pipeline = [
+    # dict(type='LoadImageFromFile', file_client_args=file_client_args),
+    # dict(type='RandomCrop', crop_size=32, padding=4),
+    # dict(type='RandomFlip', prob=0.5, direction='horizontal'),
+    # dict(type='PackClsInputs'),
+# ]
+
+# test_pipeline = [
+    # dict(type='LoadImageFromFile', file_client_args=file_client_args),
+    # dict(type='PackClsInputs'),
+# ]
+
+# train_dataloader = dict(
+#     batch_size=16,
+#     num_workers=2,
+#     dataset=dict(
+#         type=dataset_type,
+#         data_prefix='data/cifar10',
+#         test_mode=False,
+#         pipeline=train_pipeline),
+#     sampler=dict(type='DefaultSampler', shuffle=True),
+#     persistent_workers=True,
+# )
+
+# val_dataloader = dict(
+#     batch_size=16,
+#     num_workers=2,
+#     dataset=dict(
+#         type=dataset_type,
+#         data_prefix='data/cifar10/',
+#         test_mode=True,
+#         pipeline=test_pipeline),
+#     sampler=dict(type='DefaultSampler', shuffle=False),
+#     persistent_workers=True,
+# )

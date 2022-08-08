@@ -1,7 +1,9 @@
+# Copyright (c) OpenMMLab. All rights reserved.
 import torch
+
 from mmcv.runner import BaseModule
 
-from gml.models.utils.utils import get_module_device
+from mmrazor.models.utils import get_module_device
 
 
 class BaseGenerator(BaseModule):

@@ -2,7 +2,7 @@
 from typing import List, Tuple
 
 import torch
-from mmcls.data import ClsDataSample
+from mmcls.structures import ClsDataSample
 from mmcls.evaluation import Accuracy
 from mmcls.models.heads import LinearClsHead
 from torch import nn

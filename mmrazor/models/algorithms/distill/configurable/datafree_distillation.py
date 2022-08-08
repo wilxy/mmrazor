@@ -1,11 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
+from mmcv.runner import load_checkpoint
+from mmengine.optim import OptimWrapper
 
-from ...base import BaseAlgorithm, LossResults
+from mmrazor.models.utils import add_prefix
+from ...base import BaseAlgorithm
 from mmrazor.registry import MODELS
 
 
@@ -21,10 +24,9 @@ class DataFreeDistillation(BaseAlgorithm):
         distiller (dict): The config dict for built distiller.
         generator_distiller (dict): The distiller collecting outputs & losses
             to update the generator.
-        teachers (List[dict]): The list of config dict for teacher models or
+        teachers (dict[dict]): The list of config dict for teacher models or
             built teacher model.
         generator (dict | BaseModel): The generator syntheszing fake images.
-        distiller_teacher_name (str): The name of teacher used in distiller.
         student_iter (int): The number of student steps in train_step().
             Defaults to 1.
         student_train_first (bool): Whether to train student in first place.
@@ -35,247 +37,187 @@ class DataFreeDistillation(BaseAlgorithm):
         self,
         distiller: dict,
         generator_distiller: dict,
-        teachers: List[Dict],
-        generator: Union[BaseModel, Dict],
-        distiller_teacher_name: str,
+        teachers: Dict[dict, str],
+        generator: dict,
         student_iter: int = 1,
         student_train_first: bool = False,
         **kwargs) -> None:
         super().__init__(**kwargs)
 
+        self.student_iter = student_iter
+        self.student_train_first = student_train_first
         self.distiller = MODELS.build(distiller)
-        self.generator_distiller_cfg = generator_distiller
         self.generator_distiller = MODELS.build(generator_distiller)
 
         self.teachers = nn.ModuleDict()
-        for teacher in teachers:
-            teacher_name = teacher.name
+        for teacher_name, cfg in teachers.items():
             assert teacher_name not in self.teachers, \
-                f'{teacher_name} is already in teachers, please check the '
+                f'{teacher_name} is already in teachers, please check the ' \
                 'names in teachers config.'
 
-            self.teachers[teacher_name] = MODELS.build(teacher.cfg)
-            if teacher.teacher_ckpt:
+            self.teachers[teacher_name] = MODELS.build(cfg.build_cfg)
+            if cfg.ckpt_path:
                 # avoid loaded parameters be overwritten
                 self.teachers[teacher_name].init_weights()
-                _ = load_checkpoint(self.teachers[teacher_name], teacher_ckpt)
+                _ = load_checkpoint(self.teachers[teacher_name], cfg.ckpt_path)
+            self.teachers[teacher_name].eval()
 
-        assert distiller_teacher_name in self.teachers, \
-            f'{distiller_teacher_name} not in teachers.'
-        self.distiller_teacher = self.teachers[distiller_teacher_name]
-
-        if isinstance(generator, Dict):
-            self.generator = MODELS.build(generator)
-
-        if not isinstance(self.generator, BaseModel):
-            raise TypeError('generator should be a `dict` or '
-                            f'`BaseModel` instance, but got '
-                            f'{type(self.generator)}')
-
-        self.student_iter = student_iter
-        self.student_train_first = student_train_first
-
-        # In ``ConfigurableDistller``, the recorder manager is just
-        # constructed, but not really initialized yet.
-        self.distiller.prepare_from_student(self.student)
-        # TODO: support multi-teacher distillation in ConfigurableDistiller.
-        self.distiller.prepare_from_teacher(self.distiller_teacher)
+        if not isinstance(generator, Dict):
+            raise TypeError('generator should be a `dict` instance, but got '
+                            f'{type(generator)}')
+        self.generator = MODELS.build(generator)
 
         # In ``DataFreeDistiller``, the recorder manager is just
         # constructed, but not really initialized yet.
+        self.distiller.prepare_from_student(self.student)
+        self.distiller.prepare_from_teacher(self.teachers)
         self.generator_distiller.prepare_from_student(self.student)
-        self.generator_distiller.prepare_from_generator(self.generator)
-        self.generator_distiller.prepare_from_teachers(self.teachers)
+        self.generator_distiller.prepare_from_teacher(self.teachers)
 
     @property
     def student(self) -> nn.Module:
         """Alias for ``architecture``."""
         return self.architecture
 
-    def train_step(self, data, optimizer, ddp_reducer=None, z_in=None):
-        for tea in self.generator_distiller.teachers.children():
-            tea.eval()
+    def train_step(self, data, optim_wrapper):
         log_vars = OrderedDict()
 
         if self.student_train_first:
             dis_loss, dis_log_vars = self.train_student(
-                data, optimizer, ddp_reducer, z_in=z_in)
+                data, optim_wrapper['architecture'])
+
             generator_loss, generator_loss_vars = self.train_generator(
-                data, optimizer, ddp_reducer, z_in=z_in)
+                data, optim_wrapper['generator'])
         else:
             generator_loss, generator_loss_vars = self.train_generator(
-                data, optimizer, ddp_reducer, z_in=z_in)
+                data, optim_wrapper['generator'])
             dis_loss, dis_log_vars = self.train_student(
-                data, optimizer, ddp_reducer, z_in=z_in)
+                data, optim_wrapper['architecture'])
 
         log_vars.update(dis_log_vars)
         log_vars.update(generator_loss_vars)
         return dict(
             loss=generator_loss + dis_loss,
             log_vars=log_vars,
-            num_samples=len(data['img'].data))
+            num_samples=len(data))
 
-    def train_student(self, data, optimizer, ddp_reducer=None, z_in=None):
+    def train_student(self, data, optimizer):
+        log_vars = dict()
+        batch_size = len(data)
 
-        for _ in range(self.student_iter):
-            batch_size = data['img'].size(0)
-            if z_in is None:
-                z = torch.randn((batch_size, self.generator.latent_dim))
-            else:
-                z = z_in
+        for iter in range(self.student_iter):
+            fakeimg_init = torch.randn((batch_size, self.generator.latent_dim))
+            fakeimg = self.generator(fakeimg_init, batch_size).detach()
 
-            # TODO: use hook before_train_iter
-            optimizer['architecture'].zero_grad()
+            with optimizer.optim_context(self):
+                _, data_samples = self.data_preprocessor(data, True)
 
-            fakeimg = self.generator(z, batch_size).detach()
-            data.update({'img': fakeimg})
+                # recorde the needed information
+                with self.distiller.student_recorders:
+                    _ = self.student(fakeimg, data_samples, mode='loss')
+                with self.distiller.teacher_recorders, torch.no_grad():
+                    for _, teacher in self.teachers.items():
+                        _ = teacher(fakeimg, data_samples, mode='loss')
+
+                loss_distill = self.distiller.compute_distill_losses()
+            distill_loss, distill_log_vars = self.parse_losses(loss_distill)
+            optimizer.update_params(distill_loss)
+            distill_log_vars.pop('loss')
+            log_vars.update(add_prefix(distill_log_vars, 'distill_' + str(iter)))
+
+        return distill_loss, log_vars
+
+    def train_generator(self, data, optimizer):
+        # generator_losses = []
+        batch_size = len(data)
+        fakeimg_init = torch.randn((batch_size, self.generator.latent_dim))
+        fakeimg = self.generator(fakeimg_init, batch_size)
+
+        with optimizer.optim_context(self):
+            _, data_samples = self.data_preprocessor(data, True)
 
             # recorde the needed information
-            batch_inputs, data_samples = self.data_preprocessor(data, True)
-            with self.distiller.teacher_recorders, torch.no_grad():
-                _ = self.distiller_teacher(batch_inputs, data_samples, mode='loss')
-            with self.distiller.student_recorders:
-                _ = self.student(batch_inputs, data_samples, mode='loss')
+            with self.generator_distiller.student_recorders:
+                _ = self.student(fakeimg, data_samples, mode='loss')
+            with self.generator_distiller.teacher_recorders:
+                for _, teacher in self.teachers.items():
+                    _ = teacher(fakeimg, data_samples, mode='loss')
 
-            loss_distill = self.distiller.compute_distill_losses()
-            dis_loss, dis_log_vars = self.parse_losses(loss_distill)
+            loss_generator = self.generator_distiller.compute_distill_losses()
 
-            if ddp_reducer is not None:
-                from torch.nn.parallel.distributed import _find_tensors
-                ddp_reducer.prepare_for_backward(_find_tensors(dis_loss))
+        generator_loss, generator_loss_vars = self.parse_losses(loss_generator)
+        optimizer.update_params(generator_loss)
+        log_vars = dict(add_prefix(generator_loss_vars, 'generator'))
 
-            dis_loss.backward()
-            # TODO: use hook after_backward
-            optimizer['architecture'].step()
-
-        dis_log_vars['distill_loss'] = dis_log_vars.pop('loss')
-        return dis_loss, dis_log_vars
-
-    def train_generator(self, data, optimizer, ddp_reducer=None, z_in=None):
-        # generator_losses = []
-        batch_size = data['img'].size(0)
-        if z_in is None:
-            z = torch.randn((batch_size, self.generator.latent_dim))
-        else:
-            z = z_in
-        fakeimg = self.generator(z, batch_size)
-        data.update({'img': fakeimg})
-
-        optimizer['generator'].zero_grad()
-
-        # recorde the needed information
-        batch_inputs, data_samples = self.data_preprocessor(data, True)
-
-        for teacher_cfg in self.generator_distiller_cfg.teacher_cfgs:
-            teacher_name = teacher_cfg.teacher_name
-            student_recorders = teacher_cfg.get('student_recorders', None)
-            teacher_recorders = teacher_cfg.get('teacher_recorders', None)
-            generator_recorders = teacher_cfg.get('generator_recorders', None)
-
-            if student_recorders:
-                with self.generator_distiller.student_recorders:
-                    _ = self.student(batch_inputs, data_samples, mode='loss')
-            if generator_recorders:
-                with self.generator_distiller.generator_recorders:
-                    _ = self.generator(batch_inputs, data_samples, mode='loss')
-            if teacher_recorders:
-                with self.generator_distiller.multi_teacher_recorders[teacher_name], torch.no_grad():
-                    _ = self.teachers[teacher_name](batch_inputs, data_samples, mode='loss')
-
-        gan_losses = self.gan_distiller.compute_distill_losses()
-        # generator_losses.append(gan_losses)
-        generator_loss, generator_loss_vars = self.parse_losses(gan_losses)
-
-        if ddp_reducer is not None:
-            from torch.nn.parallel.distributed import _find_tensors
-            # 当前loss涉及到的参数收集起来做更新，网络静态时不需要这一步
-            ddp_reducer.prepare_for_backward(_find_tensors(generator_loss))
-
-        generator_loss.backward()
-        optimizer['generator'].step()
-        generator_loss_vars['generator_loss'] = generator_loss_vars.pop('loss')
-
-        return generator_loss, generator_loss_vars
+        return generator_loss, log_vars
 
     def val_step(self, data, optimizer):
         return self.model.val_step(data, optimizer)
 
 
 @MODELS.register_module()
-class DAFLDataFreeStudentDistillation(DataFreeStudentDistillation):
+class DAFLDataFreeDistillation(DataFreeDistillation):
 
-    def train_step(self, data, optimizer, ddp_reducer=None, z_in=None):
-        """DAFL Train step https://github.com/huawei-noah/Efficient-
-        Computing/"""
-        import pdb
-        pdb.set_trace()
-        batch_size = data['img'].size(0)
-        if z_in is None:
-            z = torch.randn((batch_size, self.generator.latent_dim))
-        else:
-            z = z_in
-        fakeimg = self.generator(z, batch_size)
-        data.update({'img': fakeimg})
+    def train_step(self, data: List[dict],
+                   optim_wrapper: OptimWrapper) -> Dict[str, torch.Tensor]:
+        """DAFL Train step
+        :meth:`train_step` will perform the following steps in order:
 
-        for tea in self.generator_distiller.teachers.children():
-            tea.eval()
+        - If :attr:`module` defines the preprocess method,
+            call ``module.preprocess`` to pre-processing data.
+        - Call ``module.forward(**data)`` and get losses.
+        - Parse losses.
+        - Call ``optim_wrapper.optimizer_step`` to update parameters.
+        - Return log messages of losses.
+
+        Args:
+            data (List[dict]): Data sampled by dataloader.
+            optim_wrapper (OptimWrapper): A wrapper of optimizer to
+                update parameters.
+
+        Returns:
+            Dict[str, torch.Tensor]: A ``dict`` of tensor for logging.
+        """
+        batch_size = len(data)
         log_vars = OrderedDict()
-        optimizer['model'].zero_grad()
-        optimizer['generator'].zero_grad()
 
-        gen_loss_vars, dis_log_vars, total_loss = self.get_train_losses(
-            data, fakeimg)
+        # fakeimg initialization and revised by generator.
+        fakeimg_init = torch.randn((batch_size, self.generator.latent_dim))  # 16 x 1000
+        fakeimg = self.generator(fakeimg_init, batch_size)  # 16 x 3 x 32 x 32
 
-        if ddp_reducer is not None:
-            from torch.nn.parallel.distributed import _find_tensors
-            ddp_reducer.prepare_for_backward(_find_tensors(total_loss))
-        total_loss.backward()
+        with optim_wrapper['generator'].optim_context(self):
+            _, data_samples = self.data_preprocessor(data, True)
+            # recorde the needed information
+            with self.generator_distiller.student_recorders:
+                _ = self.student(fakeimg, data_samples, mode='loss')
+            with self.generator_distiller.teacher_recorders:
+                for _, teacher in self.teachers.items():
+                    _ = teacher(fakeimg, data_samples, mode='loss')
+        loss_generator = self.generator_distiller.compute_distill_losses()
 
-        optimizer['generator'].step()
-        optimizer['model'].step()
+        generator_loss, generator_loss_vars = self.parse_losses(loss_generator)
+        generator_loss_vars.pop('loss')
+        log_vars.update(add_prefix(generator_loss_vars, 'generator'))
 
-        log_vars.update(gen_loss_vars)
-        log_vars.update(dis_log_vars)
+        with optim_wrapper['architecture'].optim_context(self):
+            _, data_samples = self.data_preprocessor(data, True)
+            # recorde the needed information
+            with self.distiller.student_recorders:
+                _ = self.student(fakeimg, data_samples, mode='loss')
+            with self.distiller.teacher_recorders:
+                for _, teacher in self.teachers.items():
+                    _ = teacher(fakeimg, data_samples, mode='loss')
+        loss_distill = self.distiller.compute_distill_losses()
 
+        distill_loss, distill_log_vars = self.parse_losses(loss_distill)
+        distill_log_vars.pop('loss')
+        log_vars.update(add_prefix(distill_log_vars, 'distill'))
+
+        optim_wrapper['generator'].update_params(generator_loss)
+        optim_wrapper['architecture'].update_params(distill_loss)
+
+        total_loss = generator_loss + distill_loss
         return dict(
             loss=total_loss,
             log_vars=log_vars,
-            num_samples=len(data['img'].data))
-
-    def get_train_losses(self, data, fakeimg):
-        data.update({'img': fakeimg})
-        batch_inputs, data_samples = self.data_preprocessor(data, True)
-
-        for teacher_cfg in self.generator_distiller_cfg.teacher_cfgs:
-            teacher_name = teacher_cfg.teacher_name
-            student_recorders = teacher_cfg.get('student_recorders', None)
-            teacher_recorders = teacher_cfg.get('teacher_recorders', None)
-            generator_recorders = teacher_cfg.get('generator_recorders', None)
-
-            if student_recorders:
-                with self.generator_distiller.student_recorders:
-                    _ = self.student(batch_inputs, data_samples, mode='loss')
-            if generator_recorders:
-                with self.generator_distiller.generator_recorders:
-                    _ = self.generator(batch_inputs, data_samples, mode='loss')
-            if teacher_recorders:
-                with self.generator_distiller.multi_teacher_recorders[teacher_name], torch.no_grad():
-                    _ = self.teachers[teacher_name](batch_inputs, data_samples, mode='loss')
-
-        gan_losses = self.gan_distiller.compute_distill_losses()
-        generator_loss, generator_loss_vars = self.parse_losses(gan_losses)
-        generator_loss_vars['generator_loss'] = generator_loss_vars.pop('loss')
-
-        data.update({'img': fakeimg.detach()})
-        batch_inputs, data_samples = self.data_preprocessor(data, True)
-        with self.distiller.teacher_recorders, torch.no_grad():
-            _ = self.distiller_teacher(batch_inputs, data_samples, mode='loss')
-        with self.distiller.student_recorders:
-            _ = self.student(batch_inputs, data_samples, mode='loss')
-        loss_distill = self.distiller.compute_distill_losses()
-        dis_loss, dis_log_vars = self.parse_losses(loss_distill)
-        dis_log_vars['distill_loss'] = dis_log_vars.pop('loss')
-
-        total_loss = dis_loss + generator_loss
-
-        return generator_loss_vars, dis_log_vars, total_loss
+            num_samples=len(data))
