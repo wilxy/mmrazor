@@ -16,10 +16,10 @@ class DAFLLoss(nn.Module):
         super().__init__()
         self.loss_weight = loss_weight
 
-    def forward(self, preds_T):
+    def forward(self, preds_T: torch.Tensor):
         return self.loss_weight * self.forward_train(preds_T)
 
-    def forward_trian(self, preds_T):
+    def forward_trian(self, preds_T: torch.Tensor):
         raise NotImplementedError
 
 
@@ -47,9 +47,12 @@ class ActivationLoss(DAFLLoss):
         elif self.norm_type == 'abs':
             self.norm_fn = lambda x: -x.abs().mean()
 
-    def forward_train(self, preds_T: torch.Tensor):
-        preds_T = preds_T.view(preds_T.size(0), -1)
-        return self.norm_fn(preds_T)
+    def forward(self, feat_T: torch.Tensor):
+        return self.loss_weight * self.forward_train(feat_T)
+
+    def forward_train(self, feat_T: torch.Tensor):
+        feat_T = feat_T.view(feat_T.size(0), -1)
+        return self.norm_fn(feat_T)
 
 
 @MODELS.register_module()

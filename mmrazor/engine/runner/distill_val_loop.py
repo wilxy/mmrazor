@@ -30,8 +30,6 @@ class SingleTeacherDistillValLoop(ValLoop):
                  fp16: bool = False) -> None:
         super().__init__(runner, dataloader, evaluator, fp16)
         if self.runner.distributed:
-            import pdb
-            pdb.set_trace()
             assert hasattr(self.runner.model.module, 'teacher')
             # TODO: remove hard code after mmcls add data_preprocessor
             data_preprocessor = self.runner.model.module.data_preprocessor

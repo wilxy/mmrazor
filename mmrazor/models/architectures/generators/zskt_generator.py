@@ -1,3 +1,5 @@
+from typing import Dict, Optional
+
 import torch.nn as nn
 
 from ..builder import GENERATORS
@@ -34,8 +36,9 @@ class ZSKTGenerator(BaseGenerator):
                  latent_dim,
                  hidden_channels,
                  scale_factor=2,
-                 leaky_slope=0.2):
-        super().__init__(img_size, latent_dim, hidden_channels)
+                 leaky_slope=0.2,
+                 init_cfg: Optional[Dict] = None):
+        super().__init__(img_size, latent_dim, hidden_channels, init_cfg=init_cfg)
         self.init_size = self.img_size // (scale_factor**2)
         self.scale_factor = scale_factor
         self.layers = nn.Sequential(

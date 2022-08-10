@@ -7,7 +7,7 @@ import torch.nn as nn
 from mmcv.runner import load_checkpoint
 from mmengine.optim import OptimWrapper
 
-from mmrazor.models.utils import add_prefix
+from mmrazor.models.utils import add_prefix, set_requires_grad
 from ...base import BaseAlgorithm
 from mmrazor.registry import MODELS
 
@@ -60,12 +60,14 @@ class DataFreeDistillation(BaseAlgorithm):
                 # avoid loaded parameters be overwritten
                 self.teachers[teacher_name].init_weights()
                 _ = load_checkpoint(self.teachers[teacher_name], cfg.ckpt_path)
-            self.teachers[teacher_name].eval()
+            set_requires_grad(self.teachers[teacher_name], False)
 
         if not isinstance(generator, Dict):
             raise TypeError('generator should be a `dict` instance, but got '
                             f'{type(generator)}')
         self.generator = MODELS.build(generator)
+
+        _ = load_checkpoint(self.generator, '/mnt/lustre/zhangzhongyu.vendor/work_dir/razor_dafl/separate_optim/iter_30000_only_generator.pth')
 
         # In ``DataFreeDistiller``, the recorder manager is just
         # constructed, but not really initialized yet.
@@ -83,23 +85,20 @@ class DataFreeDistillation(BaseAlgorithm):
         log_vars = OrderedDict()
 
         if self.student_train_first:
-            dis_loss, dis_log_vars = self.train_student(
+            _, dis_log_vars = self.train_student(
                 data, optim_wrapper['architecture'])
 
-            generator_loss, generator_loss_vars = self.train_generator(
+            _, generator_loss_vars = self.train_generator(
                 data, optim_wrapper['generator'])
         else:
-            generator_loss, generator_loss_vars = self.train_generator(
+            _, generator_loss_vars = self.train_generator(
                 data, optim_wrapper['generator'])
-            dis_loss, dis_log_vars = self.train_student(
+            _, dis_log_vars = self.train_student(
                 data, optim_wrapper['architecture'])
 
         log_vars.update(dis_log_vars)
         log_vars.update(generator_loss_vars)
-        return dict(
-            loss=generator_loss + dis_loss,
-            log_vars=log_vars,
-            num_samples=len(data))
+        return log_vars
 
     def train_student(self, data, optimizer):
         log_vars = dict()
@@ -118,8 +117,8 @@ class DataFreeDistillation(BaseAlgorithm):
                 with self.distiller.teacher_recorders, torch.no_grad():
                     for _, teacher in self.teachers.items():
                         _ = teacher(fakeimg, data_samples, mode='loss')
-
                 loss_distill = self.distiller.compute_distill_losses()
+
             distill_loss, distill_log_vars = self.parse_losses(loss_distill)
             optimizer.update_params(distill_loss)
             distill_log_vars.pop('loss')
@@ -142,7 +141,6 @@ class DataFreeDistillation(BaseAlgorithm):
             with self.generator_distiller.teacher_recorders:
                 for _, teacher in self.teachers.items():
                     _ = teacher(fakeimg, data_samples, mode='loss')
-
             loss_generator = self.generator_distiller.compute_distill_losses()
 
         generator_loss, generator_loss_vars = self.parse_losses(loss_generator)
@@ -150,9 +148,6 @@ class DataFreeDistillation(BaseAlgorithm):
         log_vars = dict(add_prefix(generator_loss_vars, 'generator'))
 
         return generator_loss, log_vars
-
-    def val_step(self, data, optimizer):
-        return self.model.val_step(data, optimizer)
 
 
 @MODELS.register_module()
@@ -179,12 +174,16 @@ class DAFLDataFreeDistillation(DataFreeDistillation):
             Dict[str, torch.Tensor]: A ``dict`` of tensor for logging.
         """
         batch_size = len(data)
-        log_vars = OrderedDict()
+        log_vars = dict()
+
+        for _, teacher in self.teachers.items():
+            teacher.eval()
 
         # fakeimg initialization and revised by generator.
         fakeimg_init = torch.randn((batch_size, self.generator.latent_dim))  # 16 x 1000
         fakeimg = self.generator(fakeimg_init, batch_size)  # 16 x 3 x 32 x 32
 
+        # optim_wrapper['generator'].zero_grad()
         with optim_wrapper['generator'].optim_context(self):
             _, data_samples = self.data_preprocessor(data, True)
             # recorde the needed information
@@ -196,28 +195,27 @@ class DAFLDataFreeDistillation(DataFreeDistillation):
         loss_generator = self.generator_distiller.compute_distill_losses()
 
         generator_loss, generator_loss_vars = self.parse_losses(loss_generator)
-        generator_loss_vars.pop('loss')
         log_vars.update(add_prefix(generator_loss_vars, 'generator'))
 
+        # optim_wrapper['architecture'].zero_grad()
         with optim_wrapper['architecture'].optim_context(self):
             _, data_samples = self.data_preprocessor(data, True)
             # recorde the needed information
             with self.distiller.student_recorders:
-                _ = self.student(fakeimg, data_samples, mode='loss')
-            with self.distiller.teacher_recorders:
+                _ = self.student(fakeimg.detach(), data_samples, mode='loss')
+            with self.distiller.teacher_recorders, torch.no_grad():
                 for _, teacher in self.teachers.items():
-                    _ = teacher(fakeimg, data_samples, mode='loss')
+                    _ = teacher(fakeimg.detach(), data_samples, mode='loss')
         loss_distill = self.distiller.compute_distill_losses()
 
         distill_loss, distill_log_vars = self.parse_losses(loss_distill)
         distill_log_vars.pop('loss')
         log_vars.update(add_prefix(distill_log_vars, 'distill'))
 
+        import pdb
+        pdb.set_trace()
+
         optim_wrapper['generator'].update_params(generator_loss)
         optim_wrapper['architecture'].update_params(distill_loss)
 
-        total_loss = generator_loss + distill_loss
-        return dict(
-            loss=total_loss,
-            log_vars=log_vars,
-            num_samples=len(data))
+        return log_vars

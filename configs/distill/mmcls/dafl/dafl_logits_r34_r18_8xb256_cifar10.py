@@ -10,10 +10,10 @@ model = dict(
     data_preprocessor=dict(
         type='ImgDataPreprocessor',
         # RGB format normalization parameters
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
+        mean=[125.307, 122.961, 113.8575],
+        std=[51.5865, 50.847, 51.255],
         # convert image from BGR to RGB
-        bgr_to_rgb=True),
+        bgr_to_rgb=False),
     architecture=dict(
         cfg_path='mmcls::resnet/resnet18_8xb16_cifar10.py', pretrained=False),
     teachers=dict(
@@ -36,7 +36,7 @@ model = dict(
         teacher_recorders=dict(
             res34_fc=dict(type='ModuleOutputs', source='res34.head.fc')),
         distill_losses=dict(
-            loss_kl=dict(type='KLDivergence', tau=1, loss_weight=1)),
+            loss_kl=dict(type='KLDivergence', tau=6, loss_weight=1)),
         loss_forward_mappings=dict(
             loss_kl=dict(
                 preds_S=dict(from_student=True, recorder='fc'),
@@ -56,7 +56,7 @@ model = dict(
             loss_res34_ie=dict(
                 preds_T=dict(from_student=False, recorder='res34_fc')),
             loss_res34_ac=dict(
-                preds_T=dict(from_student=False, recorder='res34_neck_gap')))))
+                feat_T=dict(from_student=False, recorder='res34_neck_gap')))))
 
 find_unused_parameters = True
 
@@ -71,77 +71,43 @@ optim_wrapper = dict(
 
 param_scheduler = dict(
     _delete_=True,
-    architecture=dict(
-        type='mmcv.StepLR',
-        step=[100 * 120, 200 * 120],
-        by_epoch=False,
-        warmup='linear',
-        warmup_iters=500,
-        warmup_ratio=0.0001,
-    ),
+    architecture=[
+        dict(
+            type='LinearLR',
+            end=500,
+            by_epoch=False,
+            start_factor=0.0001),
+        dict(
+            type='MultiStepLR',
+            begin=500,
+            milestones=[100 * 120, 200 * 120],
+            by_epoch=False)
+    ],
     generator=dict(
-        type='mmcv.FixedLR',
+        type='LinearLR',
+        end=500,
         by_epoch=False,
-        warmup='linear',
-        warmup_iters=500,
-        warmup_ratio=0.0001))
+        start_factor=0.0001))
 
-# train_cfg = dict(
-#     _delete_=True,
-#     type='mmengine.IterBasedTrainLoop',
-#     max_iters=250 * 120)
+train_dataloader = dict(
+    batch_size=256,
+    sampler=dict(type='InfiniteSampler', shuffle=True))
+val_dataloader = dict(batch_size=256)
 
 train_cfg = dict(
     _delete_=True,
     type='mmrazor.DistributedIterBasedLoop',
-    max_iters=250 * 120)
-    # is_dynamic_ddp=True)
+    max_iters=250 * 120,
+    val_interval=150)
 
-# dataset_type = 'CIFAR10'
-# preprocess_cfg = dict(
-#     # RGB format normalization parameters
-#     mean=[125.307, 122.961, 113.8575],
-#     std=[51.5865, 50.847, 51.255],
-#     # loaded images are already RGB format
-#     to_rgb=False)
-# file_client_args = dict(
-#     backend='petrel',
-#     path_mapping=dict({
-#         'data/cifar10': "s3://PAT/datasets/Imagenet"})
-# )
+val_evaluator = dict(type='Accuracy', topk=(1, 5))
 
-# train_pipeline = [
-    # dict(type='LoadImageFromFile', file_client_args=file_client_args),
-    # dict(type='RandomCrop', crop_size=32, padding=4),
-    # dict(type='RandomFlip', prob=0.5, direction='horizontal'),
-    # dict(type='PackClsInputs'),
-# ]
+default_hooks = dict(
+    logger=dict(type='LoggerHook', interval=75, log_metric_by_epoch=False),
+    checkpoint=dict(
+        type='CheckpointHook',
+        by_epoch=False,
+        interval=150,
+        max_keep_ckpts=2))
 
-# test_pipeline = [
-    # dict(type='LoadImageFromFile', file_client_args=file_client_args),
-    # dict(type='PackClsInputs'),
-# ]
-
-# train_dataloader = dict(
-#     batch_size=16,
-#     num_workers=2,
-#     dataset=dict(
-#         type=dataset_type,
-#         data_prefix='data/cifar10',
-#         test_mode=False,
-#         pipeline=train_pipeline),
-#     sampler=dict(type='DefaultSampler', shuffle=True),
-#     persistent_workers=True,
-# )
-
-# val_dataloader = dict(
-#     batch_size=16,
-#     num_workers=2,
-#     dataset=dict(
-#         type=dataset_type,
-#         data_prefix='data/cifar10/',
-#         test_mode=True,
-#         pipeline=test_pipeline),
-#     sampler=dict(type='DefaultSampler', shuffle=False),
-#     persistent_workers=True,
-# )
+log_processor = dict(by_epoch=False)

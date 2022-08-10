@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from typing import Dict, Optional
+
 import torch
 
 from mmcv.runner import BaseModule
@@ -15,8 +17,14 @@ class BaseGenerator(BaseModule):
         hidden_channels (int): the dimension of hidden channels.
     """
 
-    def __init__(self, img_size, latent_dim, hidden_channels):
-        super().__init__()
+    def __init__(
+        self,
+        img_size,
+        latent_dim,
+        hidden_channels,
+        init_cfg: Optional[Dict] = None
+    ) -> None:
+        super().__init__(init_cfg=init_cfg)
         self.img_size = img_size
         self.latent_dim = latent_dim
         self.hidden_channels = hidden_channels

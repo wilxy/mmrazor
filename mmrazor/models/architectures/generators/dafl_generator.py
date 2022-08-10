@@ -1,4 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from typing import Dict, Optional
+
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -29,9 +31,9 @@ class DAFLGenerator(BaseGenerator):
         scale_factor=2,
         bn_eps=0.8,
         leaky_slope=0.2,
+        init_cfg: Optional[Dict] = None,
     ):
-
-        super().__init__(img_size, latent_dim, hidden_channels)
+        super().__init__(img_size, latent_dim, hidden_channels, init_cfg=init_cfg)
         self.init_size = self.img_size // (scale_factor**2)
         self.scale_factor = scale_factor
         self.linear = nn.Linear(self.latent_dim,
